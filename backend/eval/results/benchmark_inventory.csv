@@ -1,0 +1,3 @@
+﻿source,file,split,rows,usable_cases,mcq_cases
+MedQA,oncology/medqa_test_oncology.jsonl,test,240,240,240
+CMExam,oncology/cmexam_test_oncology.jsonl,test,768,768,768

@@ -1,0 +1,3 @@
+﻿source,benchmark_file,selected_cases
+CMExam,oncology/cmexam_test_oncology.jsonl,75
+MedQA,oncology/medqa_test_oncology.jsonl,75

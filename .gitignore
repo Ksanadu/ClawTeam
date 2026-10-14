@@ -1,0 +1,63 @@
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python environments and caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# Frontend dependencies and build output
+node_modules/
+.next/
+out/
+dist/
+build/
+*.tsbuildinfo
+
+# Runtime sessions, uploads, and memory stores
+*.log
+*.sqlite
+*.sqlite3
+*.db
+backend/storage/
+backend/memory_module_v1/storage/*
+!backend/memory_module_v1/storage/knowledge/
+!backend/memory_module_v1/storage/knowledge/.gitkeep
+!backend/memory_module_v1/storage/memory_index/
+!backend/memory_module_v1/storage/memory_index/.gitkeep
+backend/memory_module_v1/long_term_memory/
+backend/uploads/
+backend/sessions/
+
+# Downloaded model weights, checkpoints, and local datasets
+backend/eval/models/
+backend/eval/checkpoints/
+backend/eval/datasets/data/*
+!backend/eval/datasets/data/tumor_board_cases.jsonl
+*.safetensors
+*.pt
+*.pth
+*.bin
+
+# Local reference collections unrelated to the MDT source code
+backend/knowledge/AI Knowledge/
+backend/knowledge/Financial Report Data/
+backend/knowledge/E-commerce Data/
+
+# Editor and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini

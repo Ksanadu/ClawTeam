@@ -1,0 +1,3 @@
+﻿rounds,experiment,accuracy,avg_latency_s,avg_revision_rate,relative_cost
+1 (independent),E2,0.893,59.90,-,1x
+2 (independent + critique),E3,0.887,106.88,0.810,1.8x

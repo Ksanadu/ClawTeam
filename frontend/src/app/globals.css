@@ -1,0 +1,132 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --color-ink: #10212b;
+  --color-ink-soft: rgba(16, 33, 43, 0.66);
+  --color-sand: #f6f3ee;
+  --color-frost: rgba(255, 255, 255, 0.86);
+  --color-line: rgba(16, 33, 43, 0.12);
+  --color-ocean: #087f8c;
+  --color-ocean-soft: rgba(8, 127, 140, 0.1);
+  --color-ember: #c75f43;
+  --color-ember-soft: rgba(199, 95, 67, 0.12);
+  --color-green: #25735c;
+  --color-blue: #2c6aa0;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background: linear-gradient(180deg, #f8faf9 0%, #eef3f1 100%);
+  color: var(--color-ink);
+}
+
+body {
+  font-family: var(--font-display), "Segoe UI", "Microsoft YaHei", sans-serif;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button {
+  transition: border-color 160ms ease, background-color 160ms ease, color 160ms ease, transform 160ms ease;
+}
+
+button:active {
+  transform: translateY(1px);
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.panel {
+  background: var(--color-frost);
+  border: 1px solid var(--color-line);
+  box-shadow: 0 10px 30px rgba(16, 33, 43, 0.08);
+}
+
+.surface {
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid var(--color-line);
+}
+
+.mono {
+  font-family: var(--font-mono), "Cascadia Code", monospace;
+}
+
+.markdown {
+  font-size: 0.95rem;
+  line-height: 1.72;
+}
+
+.markdown p {
+  margin: 0 0 0.75rem;
+}
+
+.markdown h1,
+.markdown h2,
+.markdown h3 {
+  margin: 1rem 0 0.45rem;
+  line-height: 1.25;
+  letter-spacing: 0;
+}
+
+.markdown h1 {
+  font-size: 1.25rem;
+}
+
+.markdown h2 {
+  font-size: 1.08rem;
+}
+
+.markdown h3 {
+  font-size: 1rem;
+}
+
+.markdown pre {
+  overflow-x: auto;
+  border-radius: 8px;
+  background: rgba(16, 33, 43, 0.92);
+  color: #f8faf9;
+  padding: 1rem;
+}
+
+.markdown code {
+  font-family: var(--font-mono), monospace;
+}
+
+.markdown ul,
+.markdown ol {
+  padding-left: 1.2rem;
+  margin: 0.4rem 0 0.8rem;
+}
+
+.markdown table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.markdown th,
+.markdown td {
+  border: 1px solid var(--color-line);
+  padding: 0.45rem 0.55rem;
+  text-align: left;
+}
+
+.markdown th {
+  background: rgba(8, 127, 140, 0.08);
+}

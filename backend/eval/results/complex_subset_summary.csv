@@ -1,0 +1,6 @@
+﻿method,method_name,cases,scored,correct,accuracy,avg_latency_s,api_calls,local_base_calls,lora_calls,vision_api_calls
+E1,E1_single,11,11,9,0.8181818181818182,2.254764900966124,11,0,0,0
+E2,E2_api_no_debate,11,11,11,1.0,61.84981953911483,44,0,0,0
+E3,E3_api_debate,11,11,10,0.9090909090909091,110.47328890860081,88,0,0,0
+E3B,E3B_local_base_debate,11,11,7,0.6363636363636364,161.02849721383643,44,44,0,0
+E4,E4_lora_heterogeneous,11,11,10,0.9090909090909091,146.93618387068537,44,0,44,0

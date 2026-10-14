@@ -1,0 +1,357 @@
+{
+  "timestamp": "2026-05-06 09:14:40",
+  "benchmark_policy": {
+    "main_accuracy_uses": "held-out public oncology MCQ benchmarks only",
+    "included_sources": [
+      "MedQA",
+      "CMExam",
+      "MedBullets"
+    ],
+    "eval_limit": 150,
+    "seed": 42,
+    "drop_training_overlap": true,
+    "tumor_board_included": false,
+    "notes": [
+      "Training scripts exclude test splits by default; existing checkpoints are guarded by the overlap report.",
+      "training_overlap_report.csv records and, by default, drops any overlap with local LoRA training jsonl files.",
+      "TumorBoard cases are qualitative unless explicitly included; they are not scored as MCQ accuracy."
+    ]
+  },
+  "heterogeneous_team": {
+    "surgeon": {
+      "expected": "global_api_or_local_qwen_base_or_local_qwen_lora_by_experiment",
+      "local_base_model": "/root/autodl-tmp/Qwen3-4B-Instruct-2507",
+      "base": "/root/autodl-tmp/Qwen3-4B-Instruct-2507",
+      "path": "eval/models/surgeon_qwen3_lora"
+    },
+    "medical_oncologist": {
+      "expected": "global_api_or_local_qwen_base_or_local_qwen_lora_by_experiment",
+      "local_base_model": "/root/autodl-tmp/Qwen3-4B-Instruct-2507",
+      "base": "/root/autodl-tmp/Qwen3-4B-Instruct-2507",
+      "path": "eval/models/oncologist_qwen3_lora"
+    },
+    "pathologist_text": {
+      "expected": "text_api_when_no_image",
+      "provider": "bailian",
+      "model": "qwen3.6-plus"
+    },
+    "pathologist_vision": {
+      "expected": "vision_api_only_when_image_attachment_exists",
+      "enabled": "true",
+      "provider": "bailian",
+      "model": "qwen3.6-plus"
+    },
+    "radiation_oncologist": {
+      "expected": "strong_text_api",
+      "provider": "bailian",
+      "model": "qwen3-max"
+    }
+  },
+  "eval_set_size": 150,
+  "scored_mcq_size": 150,
+  "source_counts": {
+    "MedQA": 75,
+    "CMExam": 75
+  },
+  "benchmark_files": [
+    "oncology/cmexam_test_oncology.jsonl",
+    "oncology/medqa_test_oncology.jsonl"
+  ],
+  "main_ablation": {
+    "E1": {
+      "config": "single-agent strong API baseline",
+      "accuracy": 0.9,
+      "correct": 135,
+      "scored_total": 150,
+      "avg_latency_s": 1.9386413740490873,
+      "avg_revision_rate": 0,
+      "avg_disagreement_count": 0,
+      "model_calls": 150,
+      "api_calls": 150,
+      "text_api_calls": 150,
+      "vision_api_calls": 0,
+      "local_base_calls": 0,
+      "lora_calls": 0,
+      "failed_calls": 0,
+      "roles_seen": "single_agent",
+      "backend_families": "api:baseline"
+    },
+    "E2": {
+      "config": "4 specialists, Round 1 only, surgeon/oncologist global API",
+      "accuracy": 0.8933333333333333,
+      "correct": 134,
+      "scored_total": 150,
+      "avg_latency_s": 59.90140523945292,
+      "avg_revision_rate": 0,
+      "avg_disagreement_count": 0,
+      "model_calls": 600,
+      "api_calls": 600,
+      "text_api_calls": 600,
+      "vision_api_calls": 0,
+      "local_base_calls": 0,
+      "lora_calls": 0,
+      "failed_calls": 0,
+      "roles_seen": "medical_oncologist|pathologist|radiation_oncologist|surgeon",
+      "backend_families": "api:global:ChatOpenAI|api:role:pathologist:ChatOpenAI|api:role:radiation_oncologist:ChatOpenAI"
+    },
+    "E3": {
+      "config": "4 specialists + Round 2 critique, surgeon/oncologist global API",
+      "accuracy": 0.8866666666666667,
+      "correct": 133,
+      "scored_total": 150,
+      "avg_latency_s": 106.8758313812688,
+      "avg_revision_rate": 0.81,
+      "avg_disagreement_count": 4.4,
+      "model_calls": 1200,
+      "api_calls": 1200,
+      "text_api_calls": 1200,
+      "vision_api_calls": 0,
+      "local_base_calls": 0,
+      "lora_calls": 0,
+      "failed_calls": 0,
+      "roles_seen": "medical_oncologist|pathologist|radiation_oncologist|surgeon",
+      "backend_families": "api:global:ChatOpenAI|api:role:pathologist:ChatOpenAI|api:role:radiation_oncologist:ChatOpenAI"
+    },
+    "E3B": {
+      "config": "E3 harness with surgeon/oncologist local Qwen3-4B base, no LoRA",
+      "accuracy": 0.8333333333333334,
+      "correct": 125,
+      "scored_total": 150,
+      "avg_latency_s": 142.90480726101745,
+      "avg_revision_rate": 0.6033333333333334,
+      "avg_disagreement_count": 4.78,
+      "model_calls": 1200,
+      "api_calls": 600,
+      "text_api_calls": 600,
+      "vision_api_calls": 0,
+      "local_base_calls": 600,
+      "lora_calls": 0,
+      "failed_calls": 0,
+      "roles_seen": "medical_oncologist|pathologist|radiation_oncologist|surgeon",
+      "backend_families": "api:role:pathologist:ChatOpenAI|api:role:radiation_oncologist:ChatOpenAI|local_base"
+    },
+    "E4": {
+      "config": "E3B + surgeon/oncologist Qwen3-4B LoRA; pathology/radiation role API unchanged",
+      "accuracy": 0.88,
+      "correct": 132,
+      "scored_total": 150,
+      "avg_latency_s": 141.53947071454178,
+      "avg_revision_rate": 0.8783333333333333,
+      "avg_disagreement_count": 4.3,
+      "model_calls": 1200,
+      "api_calls": 600,
+      "text_api_calls": 600,
+      "vision_api_calls": 0,
+      "local_base_calls": 0,
+      "lora_calls": 600,
+      "failed_calls": 0,
+      "roles_seen": "medical_oncologist|pathologist|radiation_oncologist|surgeon",
+      "backend_families": "api:role:pathologist:ChatOpenAI|api:role:radiation_oncologist:ChatOpenAI|lora"
+    }
+  },
+  "model_backend_audit": [
+    {
+      "method": "E1",
+      "role": "single_agent",
+      "backend": "api:baseline",
+      "status": "ok",
+      "calls": 150
+    },
+    {
+      "method": "E2",
+      "role": "medical_oncologist",
+      "backend": "api:global:ChatOpenAI",
+      "status": "ok",
+      "calls": 150
+    },
+    {
+      "method": "E2",
+      "role": "pathologist",
+      "backend": "api:role:pathologist:ChatOpenAI",
+      "status": "ok",
+      "calls": 150
+    },
+    {
+      "method": "E2",
+      "role": "radiation_oncologist",
+      "backend": "api:role:radiation_oncologist:ChatOpenAI",
+      "status": "ok",
+      "calls": 150
+    },
+    {
+      "method": "E2",
+      "role": "surgeon",
+      "backend": "api:global:ChatOpenAI",
+      "status": "ok",
+      "calls": 150
+    },
+    {
+      "method": "E3",
+      "role": "medical_oncologist",
+      "backend": "api:global:ChatOpenAI",
+      "status": "ok",
+      "calls": 300
+    },
+    {
+      "method": "E3",
+      "role": "pathologist",
+      "backend": "api:role:pathologist:ChatOpenAI",
+      "status": "ok",
+      "calls": 300
+    },
+    {
+      "method": "E3",
+      "role": "radiation_oncologist",
+      "backend": "api:role:radiation_oncologist:ChatOpenAI",
+      "status": "ok",
+      "calls": 300
+    },
+    {
+      "method": "E3",
+      "role": "surgeon",
+      "backend": "api:global:ChatOpenAI",
+      "status": "ok",
+      "calls": 300
+    },
+    {
+      "method": "E3B",
+      "role": "medical_oncologist",
+      "backend": "local_base",
+      "status": "ok",
+      "calls": 300
+    },
+    {
+      "method": "E3B",
+      "role": "pathologist",
+      "backend": "api:role:pathologist:ChatOpenAI",
+      "status": "ok",
+      "calls": 300
+    },
+    {
+      "method": "E3B",
+      "role": "radiation_oncologist",
+      "backend": "api:role:radiation_oncologist:ChatOpenAI",
+      "status": "ok",
+      "calls": 300
+    },
+    {
+      "method": "E3B",
+      "role": "surgeon",
+      "backend": "local_base",
+      "status": "ok",
+      "calls": 300
+    },
+    {
+      "method": "E4",
+      "role": "medical_oncologist",
+      "backend": "lora",
+      "status": "ok",
+      "calls": 300
+    },
+    {
+      "method": "E4",
+      "role": "pathologist",
+      "backend": "api:role:pathologist:ChatOpenAI",
+      "status": "ok",
+      "calls": 300
+    },
+    {
+      "method": "E4",
+      "role": "radiation_oncologist",
+      "backend": "api:role:radiation_oncologist:ChatOpenAI",
+      "status": "ok",
+      "calls": 300
+    },
+    {
+      "method": "E4",
+      "role": "surgeon",
+      "backend": "lora",
+      "status": "ok",
+      "calls": 300
+    }
+  ],
+  "complex_subset": [
+    {
+      "method": "E1",
+      "method_name": "E1_single",
+      "cases": 11,
+      "scored": 11,
+      "correct": 9,
+      "accuracy": 0.8181818181818182,
+      "avg_latency_s": 2.254764900966124,
+      "api_calls": 11,
+      "local_base_calls": 0,
+      "lora_calls": 0,
+      "vision_api_calls": 0
+    },
+    {
+      "method": "E2",
+      "method_name": "E2_api_no_debate",
+      "cases": 11,
+      "scored": 11,
+      "correct": 11,
+      "accuracy": 1.0,
+      "avg_latency_s": 61.84981953911483,
+      "api_calls": 44,
+      "local_base_calls": 0,
+      "lora_calls": 0,
+      "vision_api_calls": 0
+    },
+    {
+      "method": "E3",
+      "method_name": "E3_api_debate",
+      "cases": 11,
+      "scored": 11,
+      "correct": 10,
+      "accuracy": 0.9090909090909091,
+      "avg_latency_s": 110.47328890860081,
+      "api_calls": 88,
+      "local_base_calls": 0,
+      "lora_calls": 0,
+      "vision_api_calls": 0
+    },
+    {
+      "method": "E3B",
+      "method_name": "E3B_local_base_debate",
+      "cases": 11,
+      "scored": 11,
+      "correct": 7,
+      "accuracy": 0.6363636363636364,
+      "avg_latency_s": 161.02849721383643,
+      "api_calls": 44,
+      "local_base_calls": 44,
+      "lora_calls": 0,
+      "vision_api_calls": 0
+    },
+    {
+      "method": "E4",
+      "method_name": "E4_lora_heterogeneous",
+      "cases": 11,
+      "scored": 11,
+      "correct": 10,
+      "accuracy": 0.9090909090909091,
+      "avg_latency_s": 146.93618387068537,
+      "api_calls": 44,
+      "local_base_calls": 0,
+      "lora_calls": 44,
+      "vision_api_calls": 0
+    }
+  ],
+  "key_findings": {
+    "role_decomposition_gain_E2_vs_E1": -0.00666666666666671,
+    "debate_gain_E3_vs_E2": -0.006666666666666599,
+    "local_base_replacement_gap_E3B_vs_E3": -0.053333333333333344,
+    "strict_lora_gain_E4_vs_E3B": 0.046666666666666634,
+    "total_gain_E4_vs_E1": -0.020000000000000018
+  },
+  "caveats": [
+    "MCQ accuracy uses the same answer-format normalizer for all main groups; the normalizer maps existing outputs to A/B/C/D and does not add medical reasoning.",
+    "Public MCQ benchmarks do not evaluate pathology image understanding.",
+    "Pathologist vision API is used only when image attachments are provided; no-image cases are text-only pathology opinions.",
+    "Radiation oncologist can use a role-specific strong text API when RADIATION_ONCOLOGIST_LLM_* env vars are configured.",
+    "Strict LoRA value should be read from E4 vs E3B, not E4 vs E3, because E3 uses API prompt experts for surgeon/oncologist.",
+    "TumorBoard free-form cases should be evaluated by rubric or LLM judge separately.",
+    "Complexity assessor comparison reports distribution only because no gold complexity labels are available.",
+    "Model backend audit records api/local_base/lora/vision backend per role; E2-E4 plus E3B should include four specialist roles."
+  ]
+}
