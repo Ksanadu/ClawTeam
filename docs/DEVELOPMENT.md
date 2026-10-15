@@ -92,4 +92,4 @@ Host/Origin 限制不是认证。远程访问必须经 TLS 和认证反向代理
 
 ## CI
 
-`.github/workflows/ci.yml` 在 push/PR 上运行 Windows/Linux 后端回归，以及前端测试、类型检查、lint、生产构建。工作流不包含密钥和真实模型调用。新增文件只会在提交并推送后触发 GitHub Actions；本地验证不代表远程 CI 已运行。
+`.github/workflows/ci.yml` 在 push/PR 上运行 Windows/Linux 后端回归，以及前端测试、类型检查、lint、生产构建。工作流不包含密钥和真实模型调用。已核实的远程结果与日志链接见[基线验证结果](BASELINE_VALIDATION.md)：Ubuntu 和 Windows 后端均为 171 passed、0 skipped，包含本机 Windows 因符号链接权限跳过的 9 项测试。每次推送的最终状态以对应提交的 GitHub Actions 记录为准。

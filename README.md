@@ -200,7 +200,7 @@ http://localhost:7788
 
 不要直接把当前 API 暴露到公网或不可信局域网。远程部署需要认证反向代理、TLS，并显式设置 `CLAWTEAM_ALLOWED_HOSTS` 和 `CLAWTEAM_ALLOWED_ORIGINS`；来源/Host 检查不等于用户认证。单 Agent 的 Shell/Python 工具仍是可信本机能力，不是沙箱。
 
-测试、锁文件更新、会诊状态与部署限制见 [开发与回归测试说明](docs/DEVELOPMENT.md)。
+测试、锁文件更新、会诊状态与部署限制见 [开发与回归测试说明](docs/DEVELOPMENT.md)。已验证的 Linux / Windows CI 均为 **171 项后端测试通过、0 项跳过**，前端检查全部通过；对应提交与日志见 [基线验证结果](docs/BASELINE_VALIDATION.md)。
 
 仓库包含项目源码、训练与评测 notebook、实验结果和演示截图。API 密钥、模型权重、运行时记忆数据库及本地知识库参考资料不随仓库发布；请按环境变量模板配置自己的模型服务和本地资源。
 

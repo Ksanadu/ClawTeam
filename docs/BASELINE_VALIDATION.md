@@ -23,7 +23,19 @@
 | `pip check` | 通过，无依赖冲突 |
 | `git diff --check` | 通过，仅 Windows LF/CRLF 提示 |
 
-9 项跳过均因当前 Windows 不允许测试进程创建符号链接（WinError 1314）；模拟规范化重定向检查仍执行。Linux 测试由 GitHub Actions 执行，结果以对应提交的工作流记录为准。
+本机 Windows 的 9 项跳过均因测试进程缺少创建符号链接的权限（WinError 1314）；模拟规范化重定向检查仍执行。这 9 项已在下述 Linux 和 Windows CI 中使用真实符号链接执行并通过。
+
+## GitHub Actions 完整验证结果
+
+2026-10-15 已核实提交 [`6f14983`](https://github.com/Ksanadu/ClawTeam/commit/6f14983daa932ceaa2ff7c636629ded523769ab8) 的[回归工作流](https://github.com/Ksanadu/ClawTeam/actions/runs/38713620516)：
+
+| 检查 | 结果 | 执行记录 |
+|---|---|---|
+| 后端 pytest / Ubuntu | 171 passed，0 skipped，1 dependency deprecation warning | [Linux 日志](https://github.com/Ksanadu/ClawTeam/actions/runs/38713620516/job/116350841525) |
+| 后端 pytest / Windows | 171 passed，0 skipped，1 dependency deprecation warning | [Windows 日志](https://github.com/Ksanadu/ClawTeam/actions/runs/38713620516/job/116350841697) |
+| 前端 | 测试、类型检查、lint、生产构建全部通过 | [前端日志](https://github.com/Ksanadu/ClawTeam/actions/runs/38713620516/job/116350841267) |
+
+两套后端 CI 均执行了文件访问白名单、会话存储和记忆读取中的全部 9 项符号链接测试。以上结果对应所链接的代码提交；后续提交的状态以各自的 GitHub Actions 记录为准。
 
 ## 验证边界与剩余限制
 
