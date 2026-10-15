@@ -8,8 +8,13 @@ v3.1 升级：
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -19,6 +24,34 @@ from config import get_settings
 from graph.llm import ResolvedLLMConfig, build_llm_config_from_settings, get_llm
 
 logger = logging.getLogger(__name__)
+
+# One shared worker bounds both model loading and GPU inference, including work
+# that cannot be stopped after its awaiting request is cancelled. Never release
+# the permit on coroutine cancellation: the *worker* owns its release.
+_MODEL_WORKER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="role-model")
+_MODEL_PERMIT = threading.BoundedSemaphore(1)
+
+
+def timeout_seconds(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+        return value if math.isfinite(value) and value > 0 else default
+    except ValueError:
+        return default
+
+
+async def run_model_worker(function, *args, **kwargs):
+    while not _MODEL_PERMIT.acquire(blocking=False):
+        await asyncio.sleep(0.01)
+    try:
+        future = _MODEL_WORKER.submit(partial(function, *args, **kwargs))
+    except BaseException:
+        _MODEL_PERMIT.release()
+        raise
+    future.add_done_callback(lambda _future: _MODEL_PERMIT.release())
+    wrapped = asyncio.wrap_future(future)
+    wrapped.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+    return await asyncio.shield(wrapped)
 
 
 class RoleType(str, Enum):
@@ -47,6 +80,8 @@ class RoleOpinion:
     revisions: list[str] = field(default_factory=list)  # Round 2: 修正的判断
     evidence: list[str] = field(default_factory=list)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    status: str = "ok"
+    error: str = ""
 
 
 class RoleAgent:
@@ -155,11 +190,15 @@ class RoleAgent:
 
         source = "unknown"
         status = "ok"
+        error = ""
         try:
-            llm, source = self._build_llm_with_source(temperature=0.3)
+            llm, source = await run_model_worker(self._build_llm_with_source, temperature=0.3)
             content = await self._call_llm(llm, messages)
+            if not content.strip():
+                raise RuntimeError("Model returned an empty opinion")
         except Exception as exc:
             status = "failed"
+            error = str(exc)
             logger.error("Role %s Round 1 failed: %s", self.role_type.value, exc)
             content = f"[{self.role_label} Round 1 暂时不可用: {exc}]"
 
@@ -168,6 +207,8 @@ class RoleAgent:
             role_label=self.role_label,
             content=content,
             round_num=1,
+            status=status,
+            error=error,
             tool_calls=[{
                 "type": "model_call",
                 "role": self.role_type.value,
@@ -232,11 +273,15 @@ class RoleAgent:
 
         source = "unknown"
         status = "ok"
+        error = ""
         try:
-            llm, source = self._build_llm_with_source(temperature=0.3)
+            llm, source = await run_model_worker(self._build_llm_with_source, temperature=0.3)
             content = await self._call_llm(llm, messages)
+            if not content.strip():
+                raise RuntimeError("Model returned an empty opinion")
         except Exception as exc:
             status = "failed"
+            error = str(exc)
             logger.error("Role %s Round 2 failed: %s", self.role_type.value, exc)
             content = own_round1.content + f"\n\n[Round 2 失败，沿用 Round 1: {exc}]"
 
@@ -248,6 +293,8 @@ class RoleAgent:
             role_label=self.role_label,
             content=content,
             round_num=2,
+            status=status,
+            error=error,
             agreements=agreements,
             disagreements=disagreements,
             revisions=revisions,
@@ -287,9 +334,10 @@ class RoleAgent:
     async def _call_llm(self, llm: Any, messages: list[dict[str, str]]) -> str:
         # 如果是 LoRA agent
         if hasattr(llm, "generate") and not hasattr(llm, "ainvoke"):
-            system_msg = messages[0]["content"]
+            system_msg = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
             user_msg = messages[-1]["content"]
-            return llm.generate(
+            return await run_model_worker(
+                llm.generate,
                 system_prompt=system_msg,
                 user_text=user_msg,
                 max_new_tokens=1024,

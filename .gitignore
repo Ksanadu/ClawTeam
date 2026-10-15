@@ -39,6 +39,8 @@ backend/memory_module_v1/storage/*
 backend/memory_module_v1/long_term_memory/
 backend/uploads/
 backend/sessions/
+backend/memory_module_v1/sessions/
+frontend/coverage/
 
 # Downloaded model weights, checkpoints, and local datasets
 backend/eval/models/

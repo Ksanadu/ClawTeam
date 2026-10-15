@@ -1,0 +1,9 @@
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+pythonpath = ["backend", "."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-ra --strict-markers --disable-socket --allow-unix-socket --allow-hosts=127.0.0.1,::1"
+markers = [
+  "integration: tests that need an explicitly configured disposable external service",
+]

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -171,6 +174,32 @@ class ExchangesRepo:
 
 class ObjectsRepo:
     """CRUD for memory_v2.memory_objects."""
+
+    @contextmanager
+    def session_distillation_lock(self, session_id: str) -> Iterator[None]:
+        """Serialize distillers across processes without a long-lived transaction.
+
+        The dedicated connection owns this session-level advisory lock until it
+        is explicitly released or the connection closes (including worker death).
+        Completion must be rechecked after acquiring it.
+        """
+        digest = hashlib.sha256(f"memory_v2:distill:{session_id}".encode()).digest()
+        lock_key = int.from_bytes(digest[:8], byteorder="big", signed=True)
+        with get_connection(autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
+                try:
+                    yield
+                finally:
+                    cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+
+    def get_exchange_ids_for_session(self, session_id: str) -> set[str]:
+        """Return completed exchanges; evidence alone does not imply completion."""
+        sql = "SELECT exchange_id FROM memory_v2.memory_objects WHERE session_id = %s"
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (session_id,))
+                return {row[0] for row in cur.fetchall()}
 
     def upsert(self, obj: DistilledObject) -> None:
         sql = """

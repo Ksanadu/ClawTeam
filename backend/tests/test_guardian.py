@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from backend.config.config import get_settings
-from backend.graph.guardian import (
+from config import get_settings
+from graph.guardian import (
     GuardianMiddleware,
     GuardianRuntimeResult,
     build_guardian_request_payload,
@@ -123,7 +123,7 @@ def test_guardian_middleware_before_agent_blocks(monkeypatch: pytest.MonkeyPatch
             block_message="拦截测试",
         )
 
-    monkeypatch.setattr("backend.graph.guardian.evaluate_guardian_input", _fake_eval)
+    monkeypatch.setattr("graph.guardian.evaluate_guardian_input", _fake_eval)
     mw = GuardianMiddleware()
     out = mw.before_agent({"messages": [{"role": "user", "content": "x"}]}, None)  # type: ignore[arg-type]
     assert out is not None
@@ -144,7 +144,7 @@ def test_guardian_middleware_before_agent_passes_when_safe(monkeypatch: pytest.M
             block_message="",
         )
 
-    monkeypatch.setattr("backend.graph.guardian.evaluate_guardian_input", _safe)
+    monkeypatch.setattr("graph.guardian.evaluate_guardian_input", _safe)
     mw = GuardianMiddleware()
     assert mw.before_agent({"messages": [{"role": "user", "content": "hi"}]}, None) is None  # type: ignore[arg-type]
 

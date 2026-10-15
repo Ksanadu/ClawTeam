@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import asyncio
+from contextlib import aclosing
+from functools import partial
+from uuid import uuid4
 from pathlib import Path
 from typing import Any
 
@@ -11,8 +14,8 @@ from config import get_settings, runtime_config
 from graph.context import RequestContext
 from graph.agent_factory import build_agent_config, create_agent_from_config
 from graph.complexity_assessor import CaseComplexity, assess_complexity
-from graph.coordinator import Coordinator, MDTSession, compute_role_weights
-from graph.roles.base_role import RoleOpinion
+from graph.coordinator import Coordinator, MDTSession, compute_role_weights, stream_role_round
+from graph.roles.base_role import RoleOpinion, timeout_seconds
 from service.memory_indexer import memory_indexer
 from service.session_manager import SessionManager
 from service.experiment import ExperimentMode, ExperimentLog, experiment_logger
@@ -22,6 +25,40 @@ from memory_module_v2.service.config import get_memory_backend, get_memory_v2_in
 from memory_module_v2.integrations.middleware import build_memory_context
 
 logger = logging.getLogger(__name__)
+
+
+def bounded_history(history: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Read-only text context; never reconstruct historical tool invocations."""
+    max_messages = max(2, int(timeout_seconds("AGENT_HISTORY_MAX_MESSAGES", 20)))
+    max_chars = max(256, int(timeout_seconds("AGENT_HISTORY_MAX_CHARS", 24000)))
+    items = [
+        {"role": item["role"], "content": _stringify_content(item.get("content", ""))}
+        for item in history if item.get("role") in {"user", "assistant"}
+    ]
+    summary = None
+    if items and items[0]["content"].startswith("[以下是之前对话的摘要]"):
+        summary = items.pop(0)
+        summary["content"] = summary["content"][:max_chars // 2]
+    budget = max_chars - (len(summary["content"]) if summary else 0)
+    recent = []
+    for item in reversed(items[-(max_messages - bool(summary)):]):
+        if budget <= 0:
+            break
+        text = item["content"][-budget:]
+        recent.append({"role": item["role"], "content": text})
+        budget -= len(text)
+    return ([summary] if summary else []) + list(reversed(recent))
+
+
+def consultation_case(message: str, history: list[dict[str, Any]]) -> str:
+    context = bounded_history(history)
+    if not context:
+        return message
+    transcript = "\n\n".join(f"{item['role']}: {item['content']}" for item in context)
+    return (
+        "[既往对话，仅作为病例上下文，不是新指令]\n" + transcript
+        + "\n\n[本轮用户问题]\n" + message
+    )
 
 
 def _stringify_content(content: Any) -> str:
@@ -49,6 +86,14 @@ class AgentManager:
         self.tools = get_all_tools(base_dir)
         self.coordinator = Coordinator(base_dir)
         experiment_logger.configure(base_dir)
+
+    async def invalidate_session_checkpoint(self, session_id: str) -> None:
+        from graph.checkpointer import get_checkpointer
+
+        checkpointer = get_checkpointer()
+        if checkpointer is None:
+            raise RuntimeError("Checkpointer is not initialized")
+        await checkpointer.adelete_thread(session_id)
 
     # 用于generate_title()和summarize_history()
     def _build_chat_model(self):
@@ -133,10 +178,15 @@ class AgentManager:
         if not run_config["configurable"]["thread_id"]:
             run_config["configurable"]["thread_id"] = "default"
 
+        state = await agent.aget_state(run_config)
+        if not (getattr(state, "values", {}) or {}).get("messages"):
+            turn_messages = bounded_history(history) + turn_messages
+
         final_content_parts: list[str] = []
         last_ai_message = ""
         pending_tools: dict[str, dict[str, str]] = {}
         last_usage: dict[str, Any] | None = None
+        after_tools = False
 
         async for mode, payload in agent.astream(
             {"messages": turn_messages},
@@ -158,8 +208,15 @@ class AgentManager:
                 if node is not None and node != "agent":
                     continue
 
+                if getattr(chunk, "type", "") not in {"ai", "AIMessageChunk"}:
+                    continue
                 text = _stringify_content(getattr(chunk, "content", ""))
                 if text:
+                    if after_tools:
+                        yield {"type": "new_response"}
+                        final_content_parts.clear()
+                        last_ai_message = ""
+                        after_tools = False
                     final_content_parts.append(text)
                     yield {"type": "token", "content": text}
                 continue
@@ -177,11 +234,15 @@ class AgentManager:
                     if message_type == "ai" and not tool_calls:
                         candidate = _stringify_content(getattr(agent_message, "content", ""))
                         if candidate:
+                            if after_tools:
+                                yield {"type": "new_response"}
+                                final_content_parts.clear()
+                                after_tools = False
                             last_ai_message = candidate
 
                     if tool_calls:
                         for tool_call in tool_calls:
-                            call_id = str(tool_call.get("id") or tool_call.get("name"))
+                            call_id = str(tool_call.get("id") or uuid4().hex)
                             tool_name = str(tool_call.get("name", "tool"))
                             tool_args = tool_call.get("args", "")
                             if not isinstance(tool_args, str):
@@ -192,12 +253,13 @@ class AgentManager:
                             }
                             yield {
                                 "type": "tool_start",
+                                "tool_call_id": call_id,
                                 "tool": tool_name,
                                 "input": str(tool_args),
                             }
 
                     if message_type == "tool":
-                        tool_call_id = str(getattr(agent_message, "tool_call_id", ""))
+                        tool_call_id = str(getattr(agent_message, "tool_call_id", "") or uuid4().hex)
                         pending = pending_tools.pop(
                             tool_call_id,
                             {"tool": getattr(agent_message, "name", "tool"), "input": ""},
@@ -205,10 +267,12 @@ class AgentManager:
                         output = _stringify_content(getattr(agent_message, "content", ""))
                         yield {
                             "type": "tool_end",
+                            "tool_call_id": tool_call_id,
                             "tool": pending["tool"],
                             "output": output,
+                            "status": getattr(agent_message, "status", "success"),
                         }
-                        yield {"type": "new_response"}
+                        after_tools = True
 
         final_content = "".join(final_content_parts).strip() or last_ai_message.strip()
         # 若 LLM 返回了 usage，且本次调用启用了 Langfuse，则在结束时补充 usage 信息，方便在 Langfuse 中显示 tokens
@@ -256,13 +320,16 @@ class AgentManager:
         if self.base_dir is None or self.coordinator is None:
             raise RuntimeError("AgentManager is not initialized")
 
+        case = consultation_case(message, history)
+        failed_roles: list[dict[str, Any]] = []
+        stage_timeout = timeout_seconds("MDT_STAGE_TIMEOUT_SECONDS", 120.0)
         yield {"type": "progress", "stage": "case_received", "status": "done", "label": "病例已接收"}
 
         # Guardian 前置检查（仅 MULTI_FULL 模式启用）
         if experiment_mode.use_guardian:
             yield {"type": "progress", "stage": "guardian", "status": "running", "label": "Guardian 安全检查"}
-            from graph.guardian import evaluate_guardian_input
-            guardian_result = evaluate_guardian_input(message)
+            from graph.guardian import aevaluate_guardian_input
+            guardian_result = await aevaluate_guardian_input(message)
             if guardian_result.is_blocked:
                 yield {"type": "progress", "stage": "guardian", "status": "blocked", "label": "Guardian 已拦截"}
                 yield {
@@ -271,7 +338,7 @@ class AgentManager:
                     "reason": guardian_result.reason_code,
                     "message": guardian_result.block_message,
                 }
-                yield {"type": "done", "content": guardian_result.block_message}
+                yield {"type": "done", "content": guardian_result.block_message, "status": "blocked", "failed_roles": []}
                 return
             yield {"type": "progress", "stage": "guardian", "status": "done", "label": "Guardian 通过"}
 
@@ -313,8 +380,8 @@ class AgentManager:
         import time
 
         start = time.monotonic()
-        session = MDTSession(case=message)
-        session.complexity = await assess_complexity(message, method="llm")
+        session = MDTSession(case=case)
+        session.complexity = await asyncio.wait_for(assess_complexity(case, method="llm"), stage_timeout)
         session.latency_ms = int((time.monotonic() - start) * 1000)
 
         yield {
@@ -344,116 +411,96 @@ class AgentManager:
             if not skip_round2:
                 yield {"type": "progress", "stage": "round2", "status": "blocked", "label": "简单病例跳过 Round 2"}
             yield {"type": "progress", "stage": "synthesis", "status": "running", "label": "单专科生成结论"}
-            session.final_decision = await self.coordinator._simple_path(
-                message, memory_context, attachments
-            )
+            try:
+                session.final_decision = await asyncio.wait_for(
+                    self.coordinator._simple_path(case, memory_context, attachments), stage_timeout
+                )
+            except Exception as exc:
+                yield {"type": "error", "stage": "synthesis", "error": str(exc) or exc.__class__.__name__}
+                yield {"type": "done", "content": "专家暂时不可用，会诊未完成。", "status": "failed", "failed_roles": []}
+                return
         else:
             session.role_weights = {
-                role.value: weight for role, weight in compute_role_weights(message).items()
+                role.value: weight for role, weight in compute_role_weights(case).items()
             }
+            yield {"type": "progress", "stage": "round1", "status": "running", "label": "专科并行生成意见"}
+            calls = {
+                role: partial(agent.aconsult_round1, case, memory_context, attachments=attachments)
+                for role, agent in self.coordinator._roles.items()
+            }
+            async with aclosing(stream_role_round(calls, 1)) as results:
+                async for role, opinion, error in results:
+                    if opinion is None:
+                        failure = {"stage": "round1", "round": 1, "role": role.value, "error": error}
+                        failed_roles.append(failure)
+                        yield {"type": "role_error", **failure}
+                        continue
+                    session.round1_opinions.append(opinion)
+                    yield {
+                        "type": "role_opinion", "role": opinion.role.value,
+                        "role_label": opinion.role_label, "content": opinion.content,
+                        "round": 1, "evidence": opinion.evidence, "tool_calls": opinion.tool_calls,
+                    }
+            yield {
+                "type": "progress", "stage": "round1",
+                "status": "done" if len(session.round1_opinions) == len(calls) else "error",
+                "label": f"Round 1 {len(session.round1_opinions)}/{len(calls)}",
+            }
+            if not session.round1_opinions:
+                yield {"type": "error", "stage": "round1", "error": "所有专家均不可用，会诊未完成。"}
+                yield {"type": "done", "content": "所有专家均不可用，会诊未完成。", "status": "failed", "failed_roles": failed_roles}
+                return
 
-            yield {"type": "progress", "stage": "round1", "status": "running", "label": "四个专科并行生成意见"}
-            round1_tasks = [
-                asyncio.create_task(
-                    agent.aconsult_round1(
-                        message, memory_context, attachments=attachments
-                    )
-                )
-                for agent in self.coordinator._roles.values()
-            ]
-            total_round1 = len(round1_tasks)
-            for completed in asyncio.as_completed(round1_tasks):
-                try:
-                    opinion = await completed
-                except Exception as exc:
-                    logger.error("Round 1 role failed: %s", exc)
-                    continue
-                if not isinstance(opinion, RoleOpinion):
-                    continue
-                session.round1_opinions.append(opinion)
-                yield {
-                    "type": "progress",
-                    "stage": "round1",
-                    "status": "running",
-                    "label": f"Round 1 {len(session.round1_opinions)}/{total_round1}",
-                }
-                yield {
-                    "type": "role_opinion",
-                    "role": opinion.role.value,
-                    "role_label": opinion.role_label,
-                    "content": opinion.content,
-                    "round": 1,
-                    "evidence": opinion.evidence,
-                }
-            yield {"type": "progress", "stage": "round1", "status": "done", "label": "Round 1 专家意见完成"}
-
-            if skip_round2:
-                yield {"type": "progress", "stage": "synthesis", "status": "running", "label": "聚合 Round 1 意见"}
-                session.final_decision = await self.coordinator._aggregate(
-                    message,
-                    session.round1_opinions,
-                    weights=compute_role_weights(message),
-                )
-            else:
+            effective_opinions = list(session.round1_opinions)
+            if not skip_round2:
                 yield {"type": "progress", "stage": "round2", "status": "running", "label": "专家正在反驳修正"}
-                round2_tasks = []
-                for own in session.round1_opinions:
-                    agent = self.coordinator._roles.get(own.role)
-                    if agent is None:
-                        continue
-                    others = [op for op in session.round1_opinions if op.role != own.role]
-                    round2_tasks.append(
-                        asyncio.create_task(
-                            agent.aconsult_round2(
-                                message,
-                                own,
-                                others,
-                                memory_context,
-                                attachments=attachments,
-                            )
-                        )
+                calls = {
+                    own.role: partial(
+                        self.coordinator._roles[own.role].aconsult_round2,
+                        case, own, [op for op in session.round1_opinions if op.role != own.role],
+                        memory_context, attachments=attachments,
                     )
-                total_round2 = len(round2_tasks)
-                for completed in asyncio.as_completed(round2_tasks):
-                    try:
-                        opinion = await completed
-                    except Exception as exc:
-                        logger.error("Round 2 role failed: %s", exc)
-                        continue
-                    if not isinstance(opinion, RoleOpinion):
-                        continue
-                    session.round2_opinions.append(opinion)
-                    yield {
-                        "type": "progress",
-                        "stage": "round2",
-                        "status": "running",
-                        "label": f"Round 2 {len(session.round2_opinions)}/{total_round2}",
-                    }
-                    yield {
-                        "type": "role_opinion",
-                        "role": opinion.role.value,
-                        "role_label": f"{opinion.role_label}（Round 2）",
-                        "content": opinion.content,
-                        "round": 2,
-                        "evidence": opinion.evidence,
-                    }
+                    for own in session.round1_opinions
+                }
+                updated = {}
+                async with aclosing(stream_role_round(calls, 2)) as results:
+                    async for role, opinion, error in results:
+                        if opinion is None:
+                            failure = {"stage": "round2", "round": 2, "role": role.value, "error": error}
+                            failed_roles.append(failure)
+                            yield {"type": "role_error", **failure}
+                            continue
+                        updated[role] = opinion
+                        session.round2_opinions.append(opinion)
+                        yield {
+                            "type": "role_opinion", "role": opinion.role.value,
+                            "role_label": opinion.role_label, "content": opinion.content,
+                            "round": 2, "evidence": opinion.evidence, "tool_calls": opinion.tool_calls,
+                        }
+                # A failed revision must not discard an expert's successful Round 1.
+                effective_opinions = [updated.get(op.role, op) for op in session.round1_opinions]
                 session.revision_rate = self.coordinator._compute_revision_rate(
-                    session.round1_opinions,
-                    session.round2_opinions,
+                    session.round1_opinions, session.round2_opinions
                 )
                 session.disagreement_count = sum(len(op.disagreements) for op in session.round2_opinions)
-                yield {"type": "progress", "stage": "round2", "status": "done", "label": "Round 2 反驳修正完成"}
-                yield {
-                    "type": "collaboration_metric",
-                    "revision_rate": session.revision_rate,
-                    "disagreement_count": session.disagreement_count,
-                }
-                yield {"type": "progress", "stage": "synthesis", "status": "running", "label": "正在生成综合结论"}
-                session.final_decision = await self.coordinator._arbitrate(
-                    message,
-                    session.round2_opinions,
-                    weights=compute_role_weights(message),
+                yield {"type": "progress", "stage": "round2", "status": "done" if len(updated) == len(calls) else "error", "label": f"Round 2 {len(updated)}/{len(calls)}"}
+                yield {"type": "collaboration_metric", "revision_rate": session.revision_rate, "disagreement_count": session.disagreement_count}
+
+            yield {"type": "progress", "stage": "synthesis", "status": "running", "label": "正在生成综合结论"}
+            synthesize = self.coordinator._aggregate if skip_round2 else self.coordinator._arbitrate
+            try:
+                session.final_decision = await asyncio.wait_for(
+                    synthesize(case, effective_opinions, weights=compute_role_weights(case)), stage_timeout
                 )
+            except Exception as exc:
+                failure = {"stage": "synthesis", "role": "coordinator", "error": str(exc) or exc.__class__.__name__}
+                failed_roles.append(failure)
+                yield {"type": "role_error", **failure}
+                session.final_decision = "综合仲裁未完成；以下为已完成的专家意见，仅供讨论。\n\n" + "\n\n".join(
+                    f"{op.role_label}：{op.content}" for op in effective_opinions
+                )
+            if failed_roles:
+                session.final_decision = "[部分会诊未完成，不代表完整 MDT 共识。]\n\n" + session.final_decision
 
         session.latency_ms = int((time.monotonic() - start) * 1000)
 
@@ -482,9 +529,12 @@ class AgentManager:
             guardian_verdict="safe" if experiment_mode.use_guardian else "skipped",
             latency_ms=session.latency_ms,
         )
-        experiment_logger.log(log_entry)
+        try:
+            experiment_logger.log(log_entry)
+        except Exception:
+            logger.exception("Could not write experiment log")
 
-        yield {"type": "done", "content": synthesis}
+        yield {"type": "done", "content": synthesis, "status": "partial" if failed_roles else "success", "failed_roles": failed_roles}
 
     async def generate_title(self, first_user_message: str) -> str:
         prompt = (

@@ -1,4 +1,6 @@
 export type ToolCall = {
+  tool_call_id?: string;
+  status?: string;
   tool: string;
   input: string;
   output: string;
@@ -24,6 +26,7 @@ export type RoleOpinion = {
   content: string;
   round?: number;
   evidence?: string[];
+  tool_calls?: ToolCall[];
 };
 
 export type RoutingInfo = {
@@ -71,29 +74,60 @@ export type SessionSummary = {
   message_count: number;
 };
 
+export type RunStatus = "running" | "success" | "partial" | "failed" | "blocked" | "interrupted" | "cancelled";
+export type RoleFailure = string | { role: string; stage?: string; round?: number; error?: string };
+export type RetrievalEvent = { type: "retrieval"; query?: string; results: RetrievalResult[] } |
+  { type: "retrieval_v2"; context: string; [key: string]: unknown };
+
+export type HistoryMessage = {
+  id?: string;
+  role: "user" | "assistant";
+  content: string;
+  tool_calls?: ToolCall[];
+  tool_call_id?: string;
+  role_opinions?: RoleOpinion[];
+  routing?: RoutingInfo | null;
+  retrievals?: Array<RetrievalResult | RetrievalEvent>;
+  progress?: ProgressEvent[];
+  attachments?: ChatAttachment[];
+  guardian_blocked?: { reason: string; message: string } | null;
+  collaboration_metric?: Record<string, unknown> | null;
+  run_id?: string;
+  status?: RunStatus;
+  failed_roles?: RoleFailure[];
+  experiment_mode?: ExperimentMode;
+};
+
 export type SessionHistory = {
   id: string;
   title: string;
   created_at: number;
   updated_at: number;
   compressed_context?: string;
-  messages: Array<{
-    role: "user" | "assistant";
-    content: string;
-    tool_calls?: ToolCall[];
-  }>;
+  messages: HistoryMessage[];
 };
 
 export type StreamHandlers = {
   onEvent: (event: string, data: Record<string, unknown>) => void;
 };
 
-function getApiBase() {
+export function getApiBase() {
+  // A relative base (e.g. /api) supports a same-origin reverse proxy. Next inlines
+  // NEXT_PUBLIC_* values at build time; an explicitly empty base also means /api.
+  const configured = process.env.NEXT_PUBLIC_API_BASE_URL;
+  if (configured !== undefined) {
+    return (configured.trim() || "/api").replace(/\/+$/, "");
+  }
   if (typeof window === "undefined") {
     return "http://127.0.0.1:8002/api";
   }
-
-  return `http://${window.location.hostname}:8002/api`;
+  const { protocol, hostname, port } = window.location;
+  const isLocal = ["localhost", "127.0.0.1", "[::1]"].includes(hostname);
+  if (protocol === "http:" && (isLocal || port === "7788" || port === "3000")) {
+    return `${protocol}//${hostname}:8002/api`;
+  }
+  // Never downgrade an HTTPS page to the legacy HTTP development backend.
+  return "/api";
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -195,13 +229,13 @@ export async function streamChat(
     experiment_mode?: ExperimentMode;
     attachments?: ChatAttachment[];
   },
-  handlers: StreamHandlers
+  handlers: StreamHandlers,
+  signal?: AbortSignal
 ) {
   const response = await fetch(`${getApiBase()}/chat`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
+    signal,
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       ...payload,
       stream: true,
@@ -209,52 +243,96 @@ export async function streamChat(
     })
   });
 
-  if (!response.ok || !response.body) {
-    throw new Error(`Chat request failed: ${response.status}`);
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(detail || `Chat request failed: ${response.status}`);
+  }
+  if (!response.body) {
+    throw new Error("Chat response has no readable stream");
   }
 
   const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let line = "";
+  let skipLF = false;
+  let event = "message";
+  let dataLines: string[] = [];
+  let receivedDone = false;
+  const throwIfAborted = () => {
+    if (signal?.aborted) {
+      throw new DOMException("Generation cancelled", "AbortError");
+    }
+  };
+  const cancelReader = () => { void reader.cancel().catch(() => {}); };
 
-  const flushBlock = (block: string) => {
-    const lines = block.split("\n");
-    let event = "message";
-    const dataLines: string[] = [];
-
-    for (const line of lines) {
-      if (line.startsWith("event:")) {
-        event = line.slice(6).trim();
+  const consumeLine = () => {
+    if (!line) {
+      if (dataLines.length) {
+        const eventName = event;
+        let data: unknown;
+        try {
+          data = JSON.parse(dataLines.join("\n"));
+        } catch {
+          throw new Error(`Invalid JSON in SSE ${eventName} event`);
+        }
+        if (!data || typeof data !== "object" || Array.isArray(data)) {
+          throw new Error(`Invalid payload in SSE ${eventName} event`);
+        }
+        handlers.onEvent(eventName, data as Record<string, unknown>);
+        if (eventName === "error") {
+          const error = data as Record<string, unknown>;
+          throw new Error(String(error.error ?? error.message ?? "Chat generation failed"));
+        }
+        if (eventName === "done") receivedDone = true;
       }
-      if (line.startsWith("data:")) {
-        dataLines.push(line.slice(5).trim());
+      event = "message";
+      dataLines = [];
+    } else if (!line.startsWith(":")) {
+      const colon = line.indexOf(":");
+      const field = colon < 0 ? line : line.slice(0, colon);
+      let value = colon < 0 ? "" : line.slice(colon + 1);
+      if (value.startsWith(" ")) value = value.slice(1);
+      if (field === "event") event = value || "message";
+      if (field === "data") dataLines.push(value);
+    }
+    line = "";
+  };
+  const consume = (text: string) => {
+    // Handle CRLF even when CR and LF arrive in different byte chunks. A CR or
+    // LF ends a line; only a blank line dispatches an event (never EOF itself).
+    for (const char of text) {
+      if (skipLF && char === "\n") { skipLF = false; continue; }
+      skipLF = false;
+      if (char === "\r" || char === "\n") {
+        consumeLine();
+        skipLF = char === "\r";
+      } else {
+        line += char;
       }
     }
-
-    if (!dataLines.length) {
-      return;
-    }
-
-    const data = JSON.parse(dataLines.join("\n")) as Record<string, unknown>;
-    handlers.onEvent(event, data);
   };
 
-  while (true) {
-    const { value, done } = await reader.read();
-    buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
-
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary >= 0) {
-      flushBlock(buffer.slice(0, boundary));
-      buffer = buffer.slice(boundary + 2);
-      boundary = buffer.indexOf("\n\n");
+  signal?.addEventListener("abort", cancelReader, { once: true });
+  try {
+    throwIfAborted();
+    while (true) {
+      const { value, done } = await reader.read();
+      throwIfAborted();
+      consume(decoder.decode(value, { stream: !done }));
+      if (done) break;
     }
-
-    if (done) {
-      if (buffer.trim()) {
-        flushBlock(buffer);
-      }
-      break;
+    if (!receivedDone) {
+      throw new Error("Chat stream interrupted before done (truncated response)");
+    }
+    // Keep reading through EOF: the server may send title after done.
+  } finally {
+    signal?.removeEventListener("abort", cancelReader);
+    try {
+      await reader.cancel();
+    } catch {
+      // A failed/aborted transport may already have closed the reader.
+    } finally {
+      reader.releaseLock();
     }
   }
 }

@@ -1,17 +1,26 @@
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any
 
 import tiktoken
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from graph.agent import agent_manager
+from api.files import _resolve_path
 from service.prompt_builder import build_system_prompt
 
 router = APIRouter()
 
-ENCODER = tiktoken.get_encoding("cl100k_base")
+
+def _get_agent_manager():
+    from graph.agent import agent_manager
+    return agent_manager
+
+
+@lru_cache(maxsize=1)
+def _encoder():
+    return tiktoken.get_encoding("cl100k_base")
 
 
 class FileTokensRequest(BaseModel):
@@ -19,16 +28,22 @@ class FileTokensRequest(BaseModel):
 
 
 def _count_tokens(text: str) -> int:
-    return len(ENCODER.encode(text or ""))
+    return len(_encoder().encode(text or ""))
 
 
 @router.get("/tokens/session/{session_id}")
 async def session_tokens(session_id: str) -> dict[str, int]:
+    agent_manager = _get_agent_manager()
     session_manager = agent_manager.session_manager
     if session_manager is None or agent_manager.base_dir is None:
         raise HTTPException(status_code=503, detail="Agent manager is not initialized")
 
-    record = session_manager.get_history(session_id)
+    try:
+        record = session_manager.get_history(session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Session not found") from exc
     system_prompt = build_system_prompt(agent_manager.base_dir)
     message_text = []
     for item in record.get("messages", []):
@@ -47,13 +62,13 @@ async def session_tokens(session_id: str) -> dict[str, int]:
 
 @router.post("/tokens/files")
 async def file_tokens(payload: FileTokensRequest) -> dict[str, Any]:
-    if agent_manager.base_dir is None:
+    if _get_agent_manager().base_dir is None:
         raise HTTPException(status_code=503, detail="Agent manager is not initialized")
 
     files: list[dict[str, Any]] = []
     total = 0
     for relative_path in payload.paths:
-        path = (agent_manager.base_dir / relative_path).resolve()
+        path = _resolve_path(relative_path)
         if not path.exists() or path.is_dir():
             continue
         count = _count_tokens(path.read_text(encoding="utf-8"))

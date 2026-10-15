@@ -110,7 +110,14 @@ class GuardianMiddleware(AgentMiddleware[AgentState[ResponseT], ContextT, Respon
         state: AgentState[ResponseT],
         runtime: Runtime[ContextT],
     ) -> dict[str, Any] | None:
-        return self.before_agent(state, runtime)
+        from config import get_settings
+
+        if not get_settings().guardian_enabled:
+            return None
+        result = await aevaluate_guardian_input(last_user_text_from_agent_state(state))
+        if result.is_blocked:
+            return {"jump_to": "end", "messages": [AIMessage(content=result.block_message)]}
+        return None
 
 
 def build_guardian_middleware() -> GuardianMiddleware:
@@ -209,6 +216,47 @@ def _request_guardian_label(user_text: str) -> str:
                 parts.append(str(block.get("text", "")))
         return "".join(parts).strip()
     return str(content).strip()
+
+
+async def _arequest_guardian_label(user_text: str) -> str:
+    from config import get_settings
+    from langchain_openai import ChatOpenAI
+
+    settings = get_settings()
+    client = ChatOpenAI(
+        model=settings.guardian_model,
+        api_key=settings.guardian_api_key,
+        base_url=settings.guardian_base_url,
+        temperature=0,
+        timeout=max(0.1, settings.guardian_timeout_ms / 1000.0),
+        max_retries=0,
+    )
+    payload = build_guardian_request_payload(user_text, model=settings.guardian_model)
+    response = await client.ainvoke(payload["messages"])
+    return _stringify_message_content(getattr(response, "content", "")).strip()
+
+
+async def aevaluate_guardian_input(user_text: str) -> GuardianRuntimeResult:
+    import asyncio
+    from config import get_settings
+
+    settings = get_settings()
+    if not settings.guardian_enabled:
+        return GuardianRuntimeResult(False, "安全", "guardian_disabled", settings.guardian_block_message)
+    try:
+        raw = await asyncio.wait_for(
+            _arequest_guardian_label(user_text),
+            max(0.1, settings.guardian_timeout_ms / 1000.0),
+        )
+        label = parse_or_fallback_guardian_label(raw, settings.guardian_fail_mode)
+        reason = "guardian_dangerous" if label == "危险" else "guardian_ok"
+    except Exception as error:
+        label, reason = classify_guardian_error(
+            status_code=getattr(error, "status_code", None),
+            fail_mode=settings.guardian_fail_mode,
+            error=error,
+        )
+    return GuardianRuntimeResult(label == "危险", label, reason, settings.guardian_block_message)
 
 
 def evaluate_guardian_input(user_text: str) -> GuardianRuntimeResult:

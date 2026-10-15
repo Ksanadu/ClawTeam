@@ -114,6 +114,7 @@ class MemoryIndexer:
             return
 
         if not self._memory_path.exists():
+            self._memory_path.parent.mkdir(parents=True, exist_ok=True)
             self._memory_path.write_text("# Long-term Memory\n\n", encoding="utf-8")
 
         digest = self._file_digest()

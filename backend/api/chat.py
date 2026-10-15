@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import traceback
+from contextlib import aclosing
+from copy import deepcopy
 from typing import Any
+from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -12,13 +14,14 @@ from pydantic import BaseModel, Field
 
 from graph.context import build_request_context
 from graph.agent import agent_manager
-from graph.checkpointer import reconnect_checkpointer_async
 from memory_module_v2.service.config import get_memory_backend
 from service.experiment import ExperimentMode
+from service.session_runtime import SessionBusyError, claim_session
+from starlette.background import BackgroundTask
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter()
+_background_tasks: set[asyncio.Task] = set()
 
 
 class ChatRequest(BaseModel):
@@ -43,142 +46,245 @@ def _new_segment() -> dict[str, Any]:
     return {"content": "", "tool_calls": []}
 
 
-def _is_recoverable_checkpointer_error(exc: Exception) -> bool:
-    text = str(exc).lower()
-    return (
-        exc.__class__.__name__ == "OperationalError"
-        or "could not receive data from server" in text
-        or "software caused connection abort" in text
-    )
+class ChatRun:
+    """One accumulator for SSE, JSON and durable history; correlate tools by ID."""
+
+    def __init__(self, payload: ChatRequest):
+        self.run_id = uuid4().hex
+        self.segments: list[dict[str, Any]] = []
+        self.current = _new_segment()
+        self.tools: dict[str, dict[str, Any]] = {}
+        self.content = ""
+        self.error = ""
+        self.finished = False
+        self.metadata: dict[str, Any] = {
+            "run_id": self.run_id,
+            "experiment_mode": payload.experiment_mode,
+            "status": "running",
+            "failed_roles": [],
+            "attachments": deepcopy(payload.attachments),
+            "role_opinions": [],
+            "routing": None,
+            "retrievals": [],
+            "progress": [],
+            "guardian_blocked": None,
+            "collaboration_metric": None,
+            "events": [],
+        }
+
+    def _boundary(self):
+        if self.current["content"] or self.current["tool_calls"]:
+            self.segments.append(self.current)
+        self.current = _new_segment()
+
+    def apply(self, event: dict[str, Any]) -> dict[str, Any]:
+        event = deepcopy(event)
+        kind = event["type"]
+        if kind in {"token", "synthesis_token"}:
+            self.current["content"] += event.get("content", "")
+        elif kind == "tool_start":
+            call_id = str(event.get("tool_call_id") or uuid4().hex)
+            event["tool_call_id"] = call_id
+            tool = self.tools.get(call_id)
+            if tool is None:
+                tool = {"tool_call_id": call_id, "tool": event.get("tool", "tool"), "input": event.get("input", ""), "output": "", "status": "running"}
+                self.current["tool_calls"].append(tool)
+                self.tools[call_id] = tool
+        elif kind == "tool_end":
+            call_id = str(event.get("tool_call_id") or uuid4().hex)
+            event["tool_call_id"] = call_id
+            tool = self.tools.get(call_id)
+            if tool is None:
+                tool = {"tool_call_id": call_id, "tool": event.get("tool", "tool"), "input": ""}
+                self.current["tool_calls"].append(tool)
+                self.tools[call_id] = tool
+            tool.update(output=event.get("output", ""), status=event.get("status", "success"))
+        elif kind == "new_response":
+            self._boundary()
+        elif kind == "role_opinion":
+            self.metadata["role_opinions"].append({key: value for key, value in event.items() if key != "type"})
+        elif kind in {"routing", "guardian_blocked", "collaboration_metric"}:
+            self.metadata[kind] = {key: value for key, value in event.items() if key != "type"}
+        elif kind in {"retrieval", "retrieval_v2"}:
+            self.metadata["retrievals"].append(deepcopy(event))
+        elif kind == "progress":
+            self.metadata["progress"].append({key: value for key, value in event.items() if key != "type"})
+        elif kind == "role_error":
+            self.metadata["failed_roles"].append({key: value for key, value in event.items() if key != "type"})
+        elif kind == "error":
+            self.error = str(event.get("error", "Run failed"))
+            self.metadata["status"] = "failed"
+        elif kind == "done":
+            self.content = str(event.get("content", ""))
+            self.metadata["status"] = event.get("status") or ("failed" if self.error else "success")
+            self.metadata["failed_roles"] = event.get("failed_roles", self.metadata["failed_roles"])
+            # The authoritative done answer replaces only the final response, not
+            # earlier tool/narration segments. No raw SSE is ever returned as JSON.
+            if self.content:
+                self.current["content"] = self.content
+            self._boundary()
+            self.finished = True
+            event.update(run_id=self.run_id, status=self.metadata["status"], failed_roles=self.metadata["failed_roles"])
+        if kind not in {"token", "synthesis_token"}:
+            self.metadata["events"].append(deepcopy(event))
+        return event
+
+    def interrupt(self, status: str):
+        if self.finished:
+            return
+        self.metadata["status"] = status
+        for tool in self.tools.values():
+            if tool.get("status") == "running":
+                tool["status"] = "cancelled" if status == "cancelled" else "failed"
+        self.content = self.current["content"]
+        self._boundary()
+
+    def persist(self, manager, session_id: str):
+        segments = self.segments or [_new_segment()]
+        for index, segment in enumerate(segments):
+            # Keep rich run-level panels on the final message only.
+            metadata = deepcopy(self.metadata) if index == len(segments) - 1 else {
+                key: self.metadata[key] for key in ("run_id", "experiment_mode", "status")
+            }
+            manager.save_message(session_id, "assistant", segment["content"], tool_calls=segment["tool_calls"] or None, metadata=metadata)
+
+    def response(self):
+        return {"content": self.content, **deepcopy(self.metadata), "segments": deepcopy(self.segments), **({"error": self.error} if self.error else {})}
 
 
 @router.post("/chat")
 async def chat(payload: ChatRequest):
+    claim = claim_session(payload.session_id)
+    try:
+        claim.__enter__()
+    except SessionBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    released = False
+
+    def release():
+        nonlocal released
+        if not released:
+            released = True
+            claim.__exit__(None, None, None)
+
+    try:
+        response = await _chat_claimed(payload, release)
+        if isinstance(response, StreamingResponse):
+            response.background = BackgroundTask(release)
+        else:
+            release()
+        return response
+    except BaseException:
+        release()
+        raise
+
+
+async def _chat_claimed(payload: ChatRequest, release):
     session_manager = agent_manager.session_manager
     if session_manager is None:
         raise HTTPException(status_code=503, detail="Agent manager is not initialized")
-
-    history_record = session_manager.load_session_record(payload.session_id)
-    is_first_user_message = not any(
-        message.get("role") == "user"
-        for message in history_record.get("messages", [])
-    )
-    request_context = build_request_context(thread_id=payload.session_id)
-    # 对话历史由 checkpointer 管理，不再从 SessionManager 传入
-    history_for_agent: list[dict[str, Any]] = []
-
-    # 解析实验模式
     try:
         experiment_mode = ExperimentMode(payload.experiment_mode)
     except ValueError:
-        experiment_mode = ExperimentMode.SINGLE_AGENT
+        raise HTTPException(status_code=422, detail="Unknown experiment_mode")
 
-    def _select_stream():
-        """根据实验模式选择单 Agent 或多 Agent 流。"""
+    try:
+        history_record = session_manager.load_session_record(payload.session_id)
+        # Load before persisting this turn, so the current input appears once.
+        history_for_agent = session_manager.load_session_for_agent(payload.session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Session not found") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.exception("Could not read session")
+        raise HTTPException(status_code=500, detail="Could not read session") from exc
+
+    if experiment_mode.use_multi_agent:
+        # Multi turns bypass the single-agent graph. Clear its cached state under
+        # the same session claim so the next single turn rehydrates durable JSON
+        # (including this consultation), instead of silently missing the turn.
+        try:
+            await agent_manager.invalidate_session_checkpoint(payload.session_id)
+        except Exception as exc:
+            logger.exception("Could not invalidate single-agent checkpoint")
+            raise HTTPException(status_code=500, detail="Could not reset session context") from exc
+
+    is_first_user_message = not history_record.get("compressed_context") and not any(
+        message.get("role") == "user" for message in history_record.get("messages", [])
+    )
+    request_context = build_request_context(thread_id=payload.session_id)
+    run = ChatRun(payload)
+    try:
+        session_manager.save_message(
+            payload.session_id, "user", payload.message,
+            metadata={"run_id": run.run_id, "experiment_mode": payload.experiment_mode, "attachments": payload.attachments},
+        )
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail="Could not save message") from exc
+
+    def select_stream():
         if experiment_mode.use_multi_agent:
             return agent_manager.astream_multi_agent(
-                payload.message,
-                history_for_agent,
-                context=request_context,
-                experiment_mode=experiment_mode,
-                attachments=payload.attachments,
+                payload.message, history_for_agent, context=request_context,
+                experiment_mode=experiment_mode, attachments=payload.attachments,
             )
-        return agent_manager.astream(
-            payload.message, history_for_agent, context=request_context
-        )
+        return agent_manager.astream(payload.message, history_for_agent, context=request_context)
 
-    async def event_generator():
-        retried = False
-        while True:
-            segments: list[dict[str, Any]] = []
-            current_segment = _new_segment()
-            emitted_any_event = False
+    async def events():
+        persisted = False
+        try:
+            # Closing the stream on disconnect also closes/cancels specialist work.
+            async with aclosing(select_stream()) as source:
+                async for event in source:
+                    event = run.apply(event)
+                    if event["type"] == "done":
+                        run.persist(session_manager, payload.session_id)
+                        persisted = True
+                    yield event
+                    if event["type"] == "done":
+                        break
+            if not run.finished:
+                raise RuntimeError("Agent ended without a final result")
+            if is_first_user_message and run.metadata["status"] in {"success", "partial", "blocked"}:
+                try:
+                    title = await asyncio.wait_for(agent_manager.generate_title(payload.message), timeout=10)
+                    session_manager.set_title(payload.session_id, title)
+                    yield {"type": "title", "session_id": payload.session_id, "title": title}
+                except Exception:
+                    logger.warning("Title generation failed", exc_info=True)
+            if get_memory_backend() == "v2" and run.metadata["status"] in {"success", "partial"}:
+                task = asyncio.create_task(_distill_session_background(payload.session_id))
+                _background_tasks.add(task)
+                task.add_done_callback(_background_tasks.discard)
+        except (asyncio.CancelledError, GeneratorExit):
+            run.interrupt("cancelled")
+            raise
+        except Exception as exc:
+            # Never replay an agent invocation: a tool may have already committed
+            # a side effect even when no token/event reached the client.
+            logger.exception("Chat run failed")
+            run.interrupt("failed")
+            yield run.apply({"type": "error", "error": str(exc) or exc.__class__.__name__, "run_id": run.run_id})
+        finally:
             try:
-                async for event in _select_stream():
-                    emitted_any_event = True
-                    event_type = event["type"]
-
-                    if event_type == "token":
-                        current_segment["content"] += event.get("content", "")
-                    elif event_type == "synthesis_token":
-                        # 多 Agent 模式下，融合结论的流式 token
-                        current_segment["content"] += event.get("content", "")
-                    elif event_type in ("role_opinion", "routing", "guardian_blocked"):
-                        # 多 Agent 新事件：透传给前端，不进入 segment content
-                        pass
-                    elif event_type == "tool_start":
-                        current_segment["tool_calls"].append(
-                            {
-                                "tool": event.get("tool", "tool"),
-                                "input": event.get("input", ""),
-                                "output": "",
-                            }
-                        )
-                    elif event_type == "tool_end":
-                        if current_segment["tool_calls"]:
-                            current_segment["tool_calls"][-1]["output"] = event.get("output", "")
-                    elif event_type == "new_response":
-                        if current_segment["content"].strip() or current_segment["tool_calls"]:
-                            segments.append(current_segment)
-                        current_segment = _new_segment()
-                    elif event_type == "done":
-                        if not current_segment["content"].strip() and event.get("content"):
-                            current_segment["content"] = event["content"]
-                        if current_segment["content"].strip() or current_segment["tool_calls"]:
-                            segments.append(current_segment)
-
-                        session_manager.save_message(payload.session_id, "user", payload.message)
-                        for segment in segments:
-                            session_manager.save_message(
-                                payload.session_id,
-                                "assistant",
-                                segment["content"],
-                                tool_calls=segment["tool_calls"] or None,
-                            )
-
-                    data = {key: value for key, value in event.items() if key != "type"}
-                    yield _sse(event_type, data)
-
-                    if event_type == "done":
-                        if is_first_user_message:
-                            title = await agent_manager.generate_title(payload.message)
-                            session_manager.set_title(payload.session_id, title)
-                            yield _sse(
-                                "title",
-                                {"session_id": payload.session_id, "title": title},
-                            )
-
-                        if get_memory_backend() == "v2":
-                            asyncio.create_task(
-                                _distill_session_background(payload.session_id)
-                            )
-                return
-            except Exception as exc:
-                if (
-                    not retried
-                    and not emitted_any_event
-                    and _is_recoverable_checkpointer_error(exc)
-                ):
-                    retried = True
-                    logger.warning(
-                        "checkpointer connection dropped, reconnect and retry once: %s", exc
-                    )
-                    await reconnect_checkpointer_async()
-                    continue
-
-                print("[chat] error in event_generator", repr(exc))
-                traceback.print_exc()
-                yield _sse("error", {"error": str(exc)})
-                return
+                if not persisted:
+                    run.persist(session_manager, payload.session_id)
+            except Exception:
+                logger.exception("Could not persist failed/interrupted chat run")
+            finally:
+                release()
 
     if payload.stream:
+        async def event_generator():
+            async with aclosing(events()) as source:
+                async for event in source:
+                    yield _sse(event["type"], {key: value for key, value in event.items() if key != "type"})
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-    final_text = ""
-    async for raw_event in event_generator():
-        if raw_event.startswith("event: done"):
-            final_text = raw_event
-    return JSONResponse({"content": final_text})
+    async for _event in events():
+        pass
+    return JSONResponse(run.response(), status_code=502 if run.metadata["status"] == "failed" else 200)
 
 
 async def _distill_session_background(session_id: str) -> None:
@@ -194,15 +300,9 @@ async def _distill_session_background(session_id: str) -> None:
         if result.exchanges_new > 0:
             logger.info(
                 "Distilled session %s: %d new exchanges → %d objects",
-                session_id[:12],
-                result.exchanges_new,
-                result.objects_created,
+                session_id[:12], result.exchanges_new, result.objects_created,
             )
         if result.errors:
-            logger.warning(
-                "Distillation errors for session %s: %d",
-                session_id[:12],
-                len(result.errors),
-            )
+            logger.warning("Distillation errors for session %s: %d", session_id[:12], len(result.errors))
     except Exception as exc:
         logger.warning("Background distillation failed for %s: %s", session_id[:12], exc)

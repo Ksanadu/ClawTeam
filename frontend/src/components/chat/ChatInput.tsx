@@ -1,6 +1,6 @@
 "use client";
 
-import { ImagePlus, SendHorizonal, X } from "lucide-react";
+import { ImagePlus, SendHorizonal, Square, X } from "lucide-react";
 import { useRef, useState } from "react";
 
 import type { ChatAttachment } from "@/lib/api";
@@ -19,14 +19,21 @@ function readFileAsDataUrl(file: File) {
 
 export function ChatInput({
   disabled,
-  onSend
+  onSend,
+  isStreaming = false,
+  onStop
 }: {
   disabled: boolean;
-  onSend: (value: string, attachments?: ChatAttachment[]) => Promise<void>;
+  onSend: (value: string, attachments?: ChatAttachment[]) => Promise<boolean | void>;
+  isStreaming?: boolean;
+  onStop?: () => void;
 }) {
   const [value, setValue] = useState("");
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [fileError, setFileError] = useState("");
+  const [pending, setPending] = useState(false);
+  const submitting = useRef(false);
+  const draftRevision = useRef(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   async function addFiles(files: FileList | null) {
@@ -67,6 +74,7 @@ export function ChatInput({
       }))
     );
 
+    ++draftRevision.current;
     setAttachments((prev) => [...prev, ...next].slice(0, MAX_IMAGES));
     if (rejected.length || selected.length < files.length) {
       setFileError("已忽略非图片、超过 4MB 或超出数量限制的文件。");
@@ -77,17 +85,27 @@ export function ChatInput({
     }
   }
 
-  function submit() {
-    const nextValue =
-      value.trim() || (attachments.length ? "请结合上传的病理图像进行 MDT 会诊。" : "");
-    if (!nextValue) {
-      return;
-    }
-    const outgoingAttachments = attachments;
-    void onSend(nextValue, outgoingAttachments);
-    setValue("");
-    setAttachments([]);
+  async function submit() {
+    const nextValue = value.trim() || (attachments.length ? "请结合上传的病理图像进行 MDT 会诊。" : "");
+    if (!nextValue || disabled || submitting.current) return;
+    submitting.current = true;
+    setPending(true);
     setFileError("");
+    const revision = draftRevision.current;
+    try {
+      const accepted = await onSend(nextValue, attachments);
+      // Keep the exact draft and attachments on immediate failure. A user may
+      // edit their next draft while streaming; never clear those later edits.
+      if (accepted !== false && draftRevision.current === revision) {
+        setValue("");
+        setAttachments([]);
+      }
+    } catch (cause) {
+      setFileError(cause instanceof Error ? cause.message : "发送失败，请重试。");
+    } finally {
+      submitting.current = false;
+      setPending(false);
+    }
   }
 
   const canSend = Boolean(value.trim() || attachments.length);
@@ -105,9 +123,10 @@ export function ChatInput({
               <span className="truncate">{attachment.name}</span>
               <button
                 className="rounded p-0.5 text-[var(--color-ink-soft)] hover:bg-white hover:text-[var(--color-ink)]"
-                onClick={() =>
-                  setAttachments((prev) => prev.filter((_, itemIndex) => itemIndex !== index))
-                }
+                onClick={() => {
+                  ++draftRevision.current;
+                  setAttachments((prev) => prev.filter((_, itemIndex) => itemIndex !== index));
+                }}
                 type="button"
                 title="移除图片"
               >
@@ -122,7 +141,11 @@ export function ChatInput({
           accept="image/*"
           className="hidden"
           multiple
-          onChange={(event) => void addFiles(event.target.files)}
+          onChange={(event) => {
+            void addFiles(event.target.files).catch((cause) => {
+              setFileError(cause instanceof Error ? cause.message : "图片读取失败。");
+            });
+          }}
           ref={fileInputRef}
           type="file"
         />
@@ -137,26 +160,37 @@ export function ChatInput({
         </button>
         <textarea
           className="max-h-32 min-h-12 flex-1 resize-y rounded-lg border border-[var(--color-line)] bg-white/82 px-3 py-2 text-sm leading-6 outline-none focus:border-ocean/50 focus:bg-white"
-          onChange={(event) => setValue(event.target.value)}
+          onChange={(event) => { ++draftRevision.current; setValue(event.target.value); }}
           onKeyDown={(event) => {
             if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
               event.preventDefault();
-              submit();
+              void submit();
             }
           }}
           placeholder="输入病例、分期、病理、基因检测和需要讨论的问题。Ctrl / Cmd + Enter 发送。"
           rows={2}
           value={value}
         />
-        <button
-          className="flex h-12 shrink-0 items-center gap-2 rounded-lg bg-ocean px-4 text-sm font-medium text-white disabled:cursor-not-allowed disabled:bg-ocean/45"
-          disabled={disabled || !canSend}
-          onClick={submit}
-          type="button"
-        >
-          <SendHorizonal size={16} />
-          发送
-        </button>
+        {isStreaming && onStop ? (
+          <button
+            className="flex h-12 shrink-0 items-center gap-2 rounded-lg border border-amber-500 px-4 text-sm font-medium text-amber-800"
+            onClick={onStop}
+            type="button"
+          >
+            <Square size={16} />
+            停止生成
+          </button>
+        ) : (
+          <button
+            className="flex h-12 shrink-0 items-center gap-2 rounded-lg bg-ocean px-4 text-sm font-medium text-white disabled:cursor-not-allowed disabled:bg-ocean/45"
+            disabled={disabled || pending || !canSend}
+            onClick={() => void submit()}
+            type="button"
+          >
+            <SendHorizonal size={16} />
+            发送
+          </button>
+        )}
       </div>
       {fileError ? (
         <p className="mt-1 px-1 text-[11px] leading-4 text-amber-700">{fileError}</p>

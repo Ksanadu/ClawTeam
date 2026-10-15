@@ -46,11 +46,17 @@ export function ThoughtChain({ toolCalls }: { toolCalls: ToolCall[] }) {
 
       <div className="space-y-0 border-t border-slate-200 px-3 py-3">
         {toolCalls.map((toolCall, index) => {
-          const done = !!toolCall.output;
+          const failed = toolCall.status === "failed" || toolCall.status === "error";
+          const cancelled = toolCall.status === "cancelled";
+          const done = Boolean(toolCall.status && toolCall.status !== "running") || Boolean(toolCall.output);
+          const statusLabel = failed ? "失败" : cancelled ? "已停止" : done ? "完成" : "运行中";
+          const statusColor = failed || cancelled
+            ? "bg-red-50 text-red-700"
+            : done ? "bg-emerald-50 text-emerald-700" : "bg-ember/10 text-ember";
           const isLast = index === toolCalls.length - 1;
 
           return (
-            <div className="grid grid-cols-[22px_1fr] gap-3" key={`${toolCall.tool}-${index}`}>
+            <div className="grid grid-cols-[22px_1fr] gap-3" key={toolCall.tool_call_id ?? `${toolCall.tool}-${index}`}>
               <div className="relative flex justify-center">
                 <div
                   className={`mt-1 flex h-5 w-5 items-center justify-center rounded-full border ${
@@ -81,11 +87,9 @@ export function ThoughtChain({ toolCalls }: { toolCalls: ToolCall[] }) {
                         {toolCall.tool}
                       </span>
                       <span
-                        className={`rounded-full px-2 py-0.5 text-[11px] ${
-                          done ? "bg-emerald-50 text-emerald-700" : "bg-ember/10 text-ember"
-                        }`}
+                        className={`rounded-full px-2 py-0.5 text-[11px] ${statusColor}`}
                       >
-                        {done ? "完成" : "运行中"}
+                        {statusLabel}
                       </span>
                     </div>
                     {done && toolCall.output && (

@@ -160,12 +160,20 @@ backend/eval/notebooks/07_tumor_board_qualitative_evaluation.ipynb
 
 ### 后端
 
+推荐 Python 3.13（回归 CI 使用同一版本）。从仓库根目录创建隔离环境：
+
 ```bash
+python -m venv .venv
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+# macOS / Linux / Git Bash: source .venv/bin/activate
+# Windows Git Bash: source .venv/Scripts/activate
+python -m pip install -r backend/requirements.txt
+cp backend/config/.env.example backend/config/.env
 cd backend
-pip install -r requirements.txt
-cp config/.env.example config/.env
-uvicorn app:app --host 0.0.0.0 --port 8002 --reload
+python -m uvicorn app:app --host 127.0.0.1 --port 8002 --reload
 ```
+
+`requirements.txt` 是锁定版本的 API 运行依赖；Chroma、Postgres checkpointer、Langfuse 等可选功能使用 `backend/requirements-memory.txt`。训练依赖继续独立放在 `backend/eval/requirements_train.txt`，GPU / CUDA 环境需按设备单独配置。默认模板关闭本地 LoRA，配置模型权重和训练依赖后再显式开启。
 
 本地没有 LoRA 模型时，可以在 `backend/config/.env` 中关闭 LoRA：
 
@@ -178,7 +186,7 @@ USE_LORA_MEDICAL_ONCOLOGIST=false
 
 ```bash
 cd frontend
-npm install
+npm ci
 npm run dev
 ```
 
@@ -188,7 +196,11 @@ npm run dev
 http://localhost:7788
 ```
 
-如果后端部署在云端，需要把前端 API 地址配置到对应公网映射或 SSH tunnel 地址。
+默认仅监听本机。前端 API 地址可通过 `NEXT_PUBLIC_API_BASE_URL` 设置（包含 `/api`），修改后需重新启动开发服务器或重新构建。HTTPS 部署建议使用同源 `/api` 反向代理。
+
+不要直接把当前 API 暴露到公网或不可信局域网。远程部署需要认证反向代理、TLS，并显式设置 `CLAWTEAM_ALLOWED_HOSTS` 和 `CLAWTEAM_ALLOWED_ORIGINS`；来源/Host 检查不等于用户认证。单 Agent 的 Shell/Python 工具仍是可信本机能力，不是沙箱。
+
+测试、锁文件更新、会诊状态与部署限制见 [开发与回归测试说明](docs/DEVELOPMENT.md)。
 
 仓库包含项目源码、训练与评测 notebook、实验结果和演示截图。API 密钥、模型权重、运行时记忆数据库及本地知识库参考资料不随仓库发布；请按环境变量模板配置自己的模型服务和本地资源。
 

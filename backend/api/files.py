@@ -6,23 +6,15 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from graph.agent import agent_manager
-from service.memory_indexer import memory_indexer
-from tools.skills_scanner import refresh_snapshot, scan_skills
+from service.path_safety import normalize_editable_path, resolve_editable_path
 
 router = APIRouter()
 
-ALLOWED_PREFIXES = (
-    "workspace/",
-    "memory/",
-    "memory_module_v1/long_term_memory/",
-    "skills/",
-    "knowledge/",
-)
-ALLOWED_ROOT_FILES = {
-    "skills/SKILLS_SNAPSHOT.md",
-    "memory_module_v1/long_term_memory/MEMORY.md",
-}
+
+def _get_agent_manager():
+    # Document policy and its tests must not need to initialize the LLM stack.
+    from graph.agent import agent_manager
+    return agent_manager
 
 
 class SaveFileRequest(BaseModel):
@@ -40,65 +32,80 @@ _DEFAULT_TEMPLATES: dict[str, str] = {
 
 
 def _resolve_path(relative_path: str) -> Path:
-    if agent_manager.base_dir is None:
+    base_dir = _get_agent_manager().base_dir
+    if base_dir is None:
         raise HTTPException(status_code=503, detail="Agent manager is not initialized")
+    try:
+        return resolve_editable_path(base_dir, relative_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    normalized = relative_path.replace("\\", "/").strip("/")
 
-    # 兼容旧前端请求：直接请求 "SKILLS_SNAPSHOT.md" 或 "MEMORY.md"
-    if normalized == "SKILLS_SNAPSHOT.md":
-        normalized = "skills/SKILLS_SNAPSHOT.md"
-    elif normalized == "MEMORY.md":
-        normalized = "memory_module_v1/long_term_memory/MEMORY.md"
+def _safe_scan_skills(base_dir: Path):
+    from tools.skills_scanner import scan_skills
 
-    if normalized not in ALLOWED_ROOT_FILES and not normalized.startswith(ALLOWED_PREFIXES):
-        raise HTTPException(status_code=400, detail="Path is not in the editable whitelist")
+    # scan_skills reads instruction files; validate every target *before* it reads.
+    # Checking only its returned list would already have exposed symlink targets.
+    _resolve_path("skills/SKILLS_SNAPSHOT.md")
+    for skill_file in (base_dir / "skills").glob("*/SKILL.md"):
+        _resolve_path(skill_file.relative_to(base_dir).as_posix())
+    return scan_skills(base_dir)
 
-    candidate = (agent_manager.base_dir / normalized).resolve()
-    base_dir = agent_manager.base_dir.resolve()
-    if base_dir not in candidate.parents and candidate != base_dir:
-        raise HTTPException(status_code=400, detail="Path traversal detected")
-    return candidate
+
+def _rebuild_memory_index() -> None:
+    from service.memory_indexer import memory_indexer
+    memory_indexer.rebuild_index()
 
 
 @router.get("/files")
 async def read_file(path: str = Query(..., min_length=1)) -> dict[str, str]:
     file_path = _resolve_path(path)
-    if not file_path.exists():
-        # 对关键系统文件提供默认模板，避免前端反复收到 404
-        normalized = path.replace("\\", "/").strip("/")
-        default_content = _DEFAULT_TEMPLATES.get(normalized)
-        if default_content is not None:
+    normalized = normalize_editable_path(path)
+    try:
+        if not file_path.exists():
+            default_content = _DEFAULT_TEMPLATES.get(normalized)
+            if default_content is None:
+                raise HTTPException(status_code=404, detail="File not found")
             file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path = _resolve_path(path)
             file_path.write_text(default_content, encoding="utf-8")
-        else:
-            raise HTTPException(status_code=404, detail="File not found")
-    return {
-        "path": path.replace("\\", "/"),
-        "content": file_path.read_text(encoding="utf-8"),
-    }
+        content = file_path.read_text(encoding="utf-8")
+    except (IsADirectoryError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="Path is not a UTF-8 document") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="Unable to read document") from exc
+    return {"path": path.replace("\\", "/"), "content": content}
 
 
 @router.post("/files")
 async def save_file(payload: SaveFileRequest) -> dict[str, Any]:
     file_path = _resolve_path(payload.path)
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(payload.content, encoding="utf-8")
-
-    normalized = payload.path.replace("\\", "/")
-    if normalized in {
-        # "memory/MEMORY.md",
-        "memory_module_v1/long_term_memory/MEMORY.md",
-    }:
-        memory_indexer.rebuild_index()
-    if normalized.startswith("skills/"):
-        refresh_snapshot(agent_manager.base_dir)
-
-    return {"ok": True, "path": normalized}
+    normalized = normalize_editable_path(payload.path)
+    base_dir = _get_agent_manager().base_dir
+    assert base_dir is not None
+    # Refreshing a skill also reads other skills and writes the snapshot, so those
+    # secondary accesses must satisfy the same canonical allowlist.
+    if normalized.startswith("skills/") and normalized.endswith("/SKILL.md"):
+        _safe_scan_skills(base_dir)
+    try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path = _resolve_path(payload.path)
+        file_path.write_text(payload.content, encoding="utf-8")
+        if normalized == "memory_module_v1/long_term_memory/MEMORY.md":
+            _rebuild_memory_index()
+        if normalized.startswith("skills/") and normalized.endswith("/SKILL.md"):
+            from tools.skills_scanner import refresh_snapshot
+            refresh_snapshot(base_dir)
+    except (IsADirectoryError, UnicodeError) as exc:
+        raise HTTPException(status_code=400, detail="Path is not a UTF-8 document") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="Unable to save document") from exc
+    return {"ok": True, "path": payload.path.replace("\\", "/")}
 
 
 @router.get("/skills")
 async def list_skills() -> list[dict[str, str]]:
-    if agent_manager.base_dir is None:
+    base_dir = _get_agent_manager().base_dir
+    if base_dir is None:
         raise HTTPException(status_code=503, detail="Agent manager is not initialized")
-    return [skill.__dict__ for skill in scan_skills(agent_manager.base_dir)]
+    return [skill.__dict__ for skill in _safe_scan_skills(base_dir)]

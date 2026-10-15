@@ -26,13 +26,61 @@ from graph.complexity_assessor import (
     assess_complexity,
 )
 from graph.llm import build_llm_config_from_settings, get_llm
-from graph.roles.base_role import RoleAgent, RoleOpinion, RoleType
+from graph.roles.base_role import RoleAgent, RoleOpinion, RoleType, timeout_seconds
 from graph.roles.medical_oncologist import MedicalOncologistAgent
 from graph.roles.pathologist import PathologistAgent
 from graph.roles.radiation_oncologist import RadiationOncologistAgent
 from graph.roles.surgeon import SurgeonAgent
 
 logger = logging.getLogger(__name__)
+
+
+def opinion_succeeded(opinion: Any) -> bool:
+    return (
+        isinstance(opinion, RoleOpinion)
+        and opinion.status == "ok"
+        and bool(opinion.content.strip())
+    )
+
+
+async def stream_role_round(calls: dict[RoleType, Any], round_num: int):
+    """Own every child task until completion, timeout or generator close.
+
+    Yield (role, successful opinion or None, error). Callers must close this
+    iterator on disconnect (contextlib.aclosing) so no specialist is orphaned.
+    """
+    async def invoke(role, call):
+        try:
+            opinion = await asyncio.wait_for(
+                call(), timeout_seconds("MDT_ROLE_TIMEOUT_SECONDS", 120.0)
+            )
+            if not opinion_succeeded(opinion):
+                return role, None, getattr(opinion, "error", "") or "No usable expert opinion"
+            return role, opinion, ""
+        except Exception as exc:
+            return role, None, str(exc) or exc.__class__.__name__
+
+    tasks = {asyncio.create_task(invoke(role, call)): role for role, call in calls.items()}
+    pending = set(tasks)
+    deadline = asyncio.get_running_loop().time() + timeout_seconds("MDT_ROUND_TIMEOUT_SECONDS", 180.0)
+    try:
+        while pending:
+            remaining = max(0, deadline - asyncio.get_running_loop().time())
+            done, pending = await asyncio.wait(pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                for task in pending:
+                    yield tasks[task], None, f"Round {round_num} timed out"
+                break
+            for task in done:
+                yield task.result()
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ───────────── 角色权重（按问题相关性加权投票）─────────────
@@ -262,7 +310,12 @@ class Coordinator:
     ) -> str:
         """简单题：用最相关的角色（默认肿瘤内科）直接答。"""
         agent = self._roles[RoleType.MEDICAL_ONCOLOGIST]
-        opinion = await agent.aconsult_round1(case, memory_context, attachments=attachments)
+        opinion = await asyncio.wait_for(
+            agent.aconsult_round1(case, memory_context, attachments=attachments),
+            timeout_seconds("MDT_ROLE_TIMEOUT_SECONDS", 120.0),
+        )
+        if not opinion_succeeded(opinion):
+            raise RuntimeError(opinion.error or "No usable expert opinion")
         return opinion.content
 
     async def _run_round1(
@@ -272,15 +325,16 @@ class Coordinator:
         attachments: list[dict[str, Any]] | None = None,
     ) -> list[RoleOpinion]:
         """Round 1：4 角色并行独立思考。"""
-        tasks = [
-            agent.aconsult_round1(case, memory_context, attachments=attachments)
-            for agent in self._roles.values()
-        ]
-        opinions = await asyncio.gather(*tasks, return_exceptions=True)
-        valid = [op for op in opinions if isinstance(op, RoleOpinion)]
-        for op in opinions:
-            if isinstance(op, Exception):
-                logger.error("Round 1 role failed: %s", op)
+        calls = {
+            role: (lambda agent=agent: agent.aconsult_round1(case, memory_context, attachments=attachments))
+            for role, agent in self._roles.items()
+        }
+        valid = []
+        async for role, opinion, error in stream_role_round(calls, 1):
+            if opinion is not None:
+                valid.append(opinion)
+            else:
+                logger.error("Round 1 %s failed: %s", role.value, error)
         return valid
 
     async def _run_round2(
@@ -294,23 +348,21 @@ class Coordinator:
 
         ⭐ 这是真协作 Harness 的核心。
         """
-        tasks = []
+        calls = {}
         for own in round1:
             others = [op for op in round1 if op.role != own.role]
             agent = self._roles.get(own.role)
-            if agent is None:
-                continue
-            tasks.append(
-                agent.aconsult_round2(
+            if agent is not None:
+                calls[own.role] = lambda agent=agent, own=own, others=others: agent.aconsult_round2(
                     case, own, others, memory_context, attachments=attachments
                 )
-            )
-        opinions = await asyncio.gather(*tasks, return_exceptions=True)
-        valid = [op for op in opinions if isinstance(op, RoleOpinion)]
-        for op in opinions:
-            if isinstance(op, Exception):
-                logger.error("Round 2 role failed: %s", op)
-        return valid
+        updated = {}
+        async for role, opinion, error in stream_role_round(calls, 2):
+            if opinion is not None:
+                updated[role] = opinion
+            else:
+                logger.error("Round 2 %s failed: %s", role.value, error)
+        return [updated.get(op.role, op) for op in round1]
 
     @staticmethod
     def _compute_revision_rate(
@@ -355,7 +407,7 @@ class Coordinator:
         mode: str,
     ) -> str:
         if not opinions:
-            return "暂无可用专家意见。"
+            raise RuntimeError("No usable expert opinions; consultation failed")
 
         # 拼接所有意见 + 权重
         opinion_text = "\n\n".join(
@@ -392,20 +444,13 @@ class Coordinator:
             build_llm_config_from_settings(settings, temperature=0.2, streaming=False)
         )
 
-        try:
-            response = await llm.ainvoke([
-                {"role": "system", "content": instruction},
-                {"role": "user", "content": f"【病例】\n{case}\n\n{opinion_text}"},
-            ])
-            content = getattr(response, "content", "")
-            if isinstance(content, str):
-                return content.strip()
-            return str(content or "").strip()
-        except Exception as exc:
-            logger.error("Synthesis failed: %s", exc)
-            # 降级：直接拼接
-            parts = [f"**{op.role_label}**：{op.content[:200]}..." for op in opinions]
-            return (
-                "\n\n---\n\n".join(parts)
-                + "\n\n> 以上仅供参考，具体诊疗请以实际就医为准。"
-            )
+        response = await llm.ainvoke([
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": f"【病例】\n{case}\n\n{opinion_text}"},
+        ])
+        content = RoleAgent._extract_content(response)
+        if not content:
+            raise RuntimeError("Synthesis returned an empty answer")
+        # The streaming owner handles synthesis failure explicitly as partial,
+        # retaining expert opinions instead of silently reporting success.
+        return content

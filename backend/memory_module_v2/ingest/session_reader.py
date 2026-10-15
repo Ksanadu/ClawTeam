@@ -7,6 +7,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from service.session_manager import SessionManager
+
 from ..domain.models import NormalizedMessage
 
 logger = logging.getLogger(__name__)
@@ -25,19 +27,48 @@ def get_sessions_dir() -> Path:
     return _SESSIONS_DIR
 
 
+def _checked_sessions_dir() -> Path:
+    sessions_dir = get_sessions_dir().absolute()
+    try:
+        resolved = sessions_dir.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("Unsafe session storage path") from exc
+    if resolved != sessions_dir:
+        raise ValueError("Symlinked session storage is not allowed")
+    return resolved
+
+
+def _session_path(session_id: str) -> Path:
+    SessionManager.validate_session_id(session_id)
+    sessions_dir = _checked_sessions_dir()
+    path = sessions_dir / f"{session_id}.json"
+    try:
+        resolved = path.resolve()
+        resolved.relative_to(sessions_dir)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError("Unsafe session storage path") from exc
+    if resolved != path:
+        raise ValueError("Symlinked session storage is not allowed")
+    return resolved
+
+
 def list_session_ids() -> list[str]:
-    sessions_dir = get_sessions_dir()
+    sessions_dir = _checked_sessions_dir()
     if not sessions_dir.exists():
         return []
-    return [
-        p.stem
-        for p in sorted(sessions_dir.glob("*.json"))
-        if not p.name.startswith(".")
-    ]
+    session_ids = []
+    for path in sorted(sessions_dir.glob("*.json")):
+        try:
+            checked = _session_path(path.stem)
+        except ValueError:
+            continue
+        if checked.is_file():
+            session_ids.append(path.stem)
+    return session_ids
 
 
 def load_session_raw(session_id: str) -> dict[str, Any] | None:
-    path = get_sessions_dir() / f"{session_id}.json"
+    path = _session_path(session_id)
     if not path.exists():
         logger.warning("Session file not found: %s", path)
         return None

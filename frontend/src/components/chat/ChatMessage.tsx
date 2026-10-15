@@ -24,7 +24,7 @@ function roleCountLabel(routing?: RoutingInfo | null) {
 }
 
 function progressFor(progress: ProgressEvent[] | undefined, stage: string) {
-  return progress?.find((item) => item.stage === stage);
+  return progress ? [...progress].reverse().find((item) => item.stage === stage) : undefined;
 }
 
 function inferredProgress({

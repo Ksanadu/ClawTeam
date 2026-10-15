@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from service.http_security import configure_http_security
 
 from api.chat import router as chat_router
 from api.compress import router as compress_router
@@ -37,13 +37,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+configure_http_security(app)
 
 app.include_router(chat_router, prefix="/api", tags=["chat"])
 app.include_router(sessions_router, prefix="/api", tags=["sessions"])

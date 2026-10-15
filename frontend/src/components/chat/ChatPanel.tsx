@@ -16,7 +16,7 @@ const modeLabel: Record<string, string> = {
 };
 
 export function ChatPanel() {
-  const { messages, sendMessage, isStreaming, tokenStats, experimentMode } = useAppStore();
+  const { messages, sendMessage, isStreaming, isLoadingSession, stopGeneration, error, tokenStats, experimentMode } = useAppStore();
   const endRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -90,24 +90,37 @@ export function ChatPanel() {
           )}
 
           {messages.map((message) => (
-            <ChatMessage
-              content={message.content}
-              key={message.id}
-              retrievals={message.retrievals}
-              role={message.role}
-              toolCalls={message.toolCalls}
-              roleOpinions={message.roleOpinions}
-              routing={message.routing}
-              guardianBlocked={message.guardianBlocked}
-              progress={message.progress}
-              attachments={message.attachments}
-            />
+            <div key={message.id}>
+              {message.status && message.status !== "success" ? (
+                <p className="mb-2 text-xs text-amber-800" role="status">
+                  {{ running: "生成中", partial: "部分完成", failed: "生成失败", blocked: "请求已拦截", interrupted: "生成中断", cancelled: "生成已停止" }[message.status]}
+                  {message.failedRoles?.length ? ` · 失败专科: ${message.failedRoles.map((failure) => typeof failure === "string" ? failure : `${failure.role}${failure.round ? ` R${failure.round}` : ""}: ${failure.error ?? "失败"}`).join("、")}` : ""}
+                </p>
+              ) : null}
+              <ChatMessage
+                content={message.content}
+                retrievals={message.retrievals}
+                role={message.role}
+                toolCalls={message.toolCalls}
+                roleOpinions={message.roleOpinions}
+                routing={message.routing}
+                guardianBlocked={message.guardianBlocked}
+                progress={message.progress}
+                attachments={message.attachments}
+              />
+            </div>
           ))}
           <div ref={endRef} />
         </div>
       </div>
 
-      <ChatInput disabled={isStreaming} onSend={sendMessage} />
+      {error ? <p className="text-sm text-red-700" role="alert">{error}</p> : null}
+      <ChatInput
+        disabled={isStreaming || isLoadingSession}
+        isStreaming={isStreaming}
+        onSend={sendMessage}
+        onStop={stopGeneration}
+      />
     </section>
   );
 }
